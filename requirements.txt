@@ -1,0 +1,11 @@
+# Scentsation hub (project root)
+pyserial>=3.5
+numpy>=1.21.0
+scikit-learn>=1.0.0
+joblib>=1.1.0
+pyyaml>=6.0
+openai>=1.0.0
+python-dotenv>=1.0.0
+rich>=13.0.0
+# Optional: microphone input in ask_user()
+# speech_recognition>=3.10.0

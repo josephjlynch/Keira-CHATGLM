@@ -1,0 +1,105 @@
+# Scentsation ML Training Pipeline — Configuration
+# Usage:  python train.py --config config.yaml
+#         python train.py --config config.yaml --mock-data
+
+data:
+  wesad:
+    raw_dir: "data/wesad/raw"
+    processed_dir: "data/wesad/processed"
+  young_adult:
+    raw_dir: "data/young_adult/raw"
+    processed_dir: "data/young_adult/processed"
+  custom:
+    path: "datasets/custom_scent_data.csv"
+  output_dir: "data/merged"
+
+window:
+  size_sec: 10.0
+  overlap_ratio: 0.5
+  gsr_sample_rate: 4
+  ecg_sample_rate: 64
+
+features:
+  gsr:
+    mean: true
+    std: true
+    max: true
+    min: true
+    slope: true
+    num_peaks: true
+    peak_amp_mean: true
+    first_diff_mean: true
+    first_diff_std: true
+  hrv:
+    mean_hr: true
+    std_hr: true
+    rmssd: true
+    sdnn: true
+    pnn50: true
+    lf_hf_ratio: true
+
+models:
+  svm:
+    kernel: "rbf"
+    C_values: [0.1, 1, 10, 100]
+    gamma_values: ["scale", "auto", 0.01, 0.1]
+    cv_folds: 2
+    class_weight: "balanced"
+    n_jobs: -1
+    verbose: 1
+  mlp:
+    hidden_layer_sizes:
+      - [128, 64]
+      - [64, 32]
+      - [256, 128, 64]
+    learning_rate_init: [0.001, 0.0005]
+    max_iter: [300, 500]
+    activation: "relu"
+    solver: "adam"
+    batch_size: "auto"
+    early_stopping: false
+    validation_fraction: 0.1
+    n_iter_no_change: 10
+    random_state: 42
+    cv_folds: 2
+    n_jobs: 1
+    verbose: 1
+  knn:
+    n_neighbors: [3, 5, 7, 11]
+    weights: ["uniform", "distance"]
+    metric: ["euclidean", "manhattan"]
+    cv_folds: 2
+    n_jobs: -1
+    verbose: 1
+  ensemble:
+    voting: "soft"
+    min_individual_accuracy: 0.70
+
+training:
+  subject_split:
+    train_ratio: 0.70
+    val_ratio: 0.15
+    test_ratio: 0.15
+  random_state: 42
+  n_jobs: -1
+  verbose: 2
+  finetune:
+    additional_epochs: 100
+    learning_rate: 0.0001
+    svm_retrain: true
+    knn_refit: true
+
+output:
+  model_dir: "models"
+  results_dir: "results"
+  scaler_path: "models/scaler.joblib"
+  best_model_path: "models/best_model.joblib"
+  finetuned_model_path: "models/finetuned_model.joblib"
+  confusion_matrix_path: "results/confusion_matrix.png"
+  roc_curve_path: "results/roc_curves.png"
+  feature_importance_path: "results/feature_importance.png"
+  report_path: "results/report.txt"
+
+classes:
+  # Must match integer labels: 0=NEUTRAL, 1=RELAXED, 2=STRESSED, 3=FOCUSED
+  names: ["NEUTRAL", "RELAXED", "STRESSED", "FOCUSED"]

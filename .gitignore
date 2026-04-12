@@ -1,0 +1,20 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Secrets and local env
+.env
+.env.*
+
+# Runtime logs (session CSVs)
+logs/
+
+# OS / editor
+.DS_Store
+
+# Optional: uncomment to keep trained weights out of git
+# models/*.joblib

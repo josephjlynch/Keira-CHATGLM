@@ -1,0 +1,25 @@
+Scentsation ML report
+==================================================
+
+Best (by val F1): SVM
+
+SVM: acc=0.7500 f1=0.6667
+MLP: acc=0.7500 f1=0.6667
+KNN: acc=0.3333 f1=0.3006
+
+Features:
+  1. gsr_mean
+  2. gsr_std
+  3. gsr_max
+  4. gsr_min
+  5. gsr_slope
+  6. gsr_num_peaks
+  7. gsr_peak_amp_mean
+  8. gsr_first_diff_mean
+  9. gsr_first_diff_std
+  10. hrv_mean_hr
+  11. hrv_std_hr
+  12. hrv_rmssd
+  13. hrv_sdnn
+  14. hrv_pnn50
+  15. hrv_lf_hf_ratio
