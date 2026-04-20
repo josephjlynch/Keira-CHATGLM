@@ -19,6 +19,10 @@ Canonical feature order is defined once in **[`config/hub_feature_names.json`](.
 
 The hub **attempts to reopen** serial ports after sustained read errors (e.g. brief USB glitches). If a device stays missing or the wrong `ESP32_PORT` / `ARDUINO_PORT` is set, **restart the process** after fixing wiring — recovery is best-effort, not guaranteed.
 
+## Mock mode (`--mock-mode`)
+
+Synthetic data are **demonstration-only** (not clinical): HR/HRV are **coupled** via a simulated RR-interval process; GSR uses tonic drift plus small phasic bumps. For repeatable demos or screenshots, set **`SCENTSATION_MOCK_SEED=123`** (any integer).
+
 ## CLI hints
 
 - `scentsation_hub.py --help` documents `--allow-bare-model` and ports. After replug, confirm `ESP32_PORT` / `ARDUINO_PORT` match `ls` of your OS.

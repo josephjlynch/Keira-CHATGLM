@@ -13,6 +13,9 @@ __pycache__/
 # Runtime logs (session CSVs)
 logs/
 
+# Raw labeled physiology sessions (local collection)
+data/raw_labeled/
+
 # OS / editor
 .DS_Store
 

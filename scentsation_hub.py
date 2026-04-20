@@ -31,12 +31,21 @@ Example .env (do not commit secrets):
     ``compute_features()``). This matches the MVP hub specification; the
     separate ``scentsation_ml`` trainer exports 15-D features — retrain or
     export a 6-D model for on-device inference if you need parity.
+
+    Live tuning: ``--buffer-window-sec`` widens the rolling feature window;
+    ``--ml-focus-vote-window-sec`` sets how many seconds of observe-phase
+    predictions count toward the FOCUSED blend gate (``ml_match``).
+
+    One USB board (sensors only): use ``--sensor-port`` / ``--esp32-port`` for the
+    device that prints ``GSR:,HR:,HRV:`` and add ``--mock-pumps`` so the hub does
+    not open a second serial port for relays. See ``firmware/uno_cheezppg_hub_stream/``.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import errno
 import json
 import logging
 import math
@@ -190,9 +199,16 @@ class Config:
     observe_duration: int = 10
     scent_notes: List[str] = field(default_factory=list)
     model_path: str = "models/classifier.joblib"
+    # Feature window for ``compute_features`` (wider = smoother GSR/HR stats, less flicker).
     buffer_window_sec: float = 10.0
+    # Wall-clock seconds at end of the observe phase used for blend ``ml_match``
+    # (any FOCUSED in this window). Replaces a fixed last-N-ingest slice so vote
+    # length matches real time when the loop polls faster than 4 Hz.
+    ml_focus_vote_window_sec: float = 8.0
     use_llm: bool = True
     mock_mode: bool = False
+    # Real sensor serial on ``esp32_port``; do not open ``arduino_port`` (pump commands no-op).
+    mock_pumps: bool = False
     no_dashboard: bool = False
     zhipu_api_key: str = ""
     zhipu_base_url: str = "https://open.bigmodel.cn/api/paas/v4/"
@@ -281,10 +297,13 @@ def preflight_serial_ports(cfg: Config) -> None:
             )
         )
         sys.exit(1)
-    pairs: Tuple[Tuple[str, str], ...] = (
-        (cfg.esp32_port, "ESP32 (sensors)"),
-        (cfg.arduino_port, "Arduino (pumps)"),
-    )
+    if cfg.mock_pumps:
+        pairs = ((cfg.esp32_port, "Sensor serial (GSR:,HR:,HRV:)"),)
+    else:
+        pairs = (
+            (cfg.esp32_port, "ESP32 / sensor serial (GSR:,HR:,HRV:)"),
+            (cfg.arduino_port, "Arduino (pumps)"),
+        )
     for path, label in pairs:
         try:
             ser = serial.Serial(path, cfg.baud_rate, timeout=0.2)
@@ -298,8 +317,8 @@ def preflight_serial_ports(cfg: Config) -> None:
                 Panel(
                     f"Could not open [bold]{path}[/bold] ({label}).\n\n"
                     "Check USB cables, permissions, and that the device is enumerated. "
-                    "Confirm [bold]ESP32_PORT[/bold] and [bold]ARDUINO_PORT[/bold] "
-                    "match your system (e.g. `ls /dev/tty.*` on macOS/Linux).\n\n"
+                    "Confirm [bold]ESP32_PORT[/bold] / sensor port and [bold]ARDUINO_PORT[/bold] "
+                    "match your system (e.g. `ls /dev/cu.*` on macOS).\n\n"
                     f"Error: {e!r}",
                     title="Serial preflight failed",
                     border_style="red",
@@ -601,6 +620,19 @@ class SerialManager:
         """Consecutive serial read errors on the background thread (diagnostics)."""
         return self._consec_serial_errors
 
+    @staticmethod
+    def _is_expected_port_close_read_error(exc: BaseException, stop: threading.Event) -> bool:
+        """True when ``close()`` closed the FD while ``readline()`` was blocked (benign on shutdown)."""
+        if not stop.is_set():
+            return False
+        if isinstance(exc, OSError) and getattr(exc, "errno", None) == errno.EBADF:
+            return True
+        if serial is not None and isinstance(exc, serial.SerialException):
+            s = str(exc).lower()
+            if "bad file descriptor" in s or "errno 9" in s:
+                return True
+        return False
+
     def start(self) -> None:
         """Open the port and start the background thread."""
         if not self._ensure_serial_open():
@@ -632,6 +664,8 @@ class SerialManager:
                             self._rx_lines.put_nowait(line_str)
                     self._consec_serial_errors = 0
             except Exception as e:
+                if self._is_expected_port_close_read_error(e, self._stop):
+                    break
                 self._consec_serial_errors += 1
                 recoverable = isinstance(e, OSError) or (
                     serial is not None and isinstance(e, serial.SerialException)
@@ -680,6 +714,8 @@ class SerialManager:
                     self.queue.put_nowait(reading)
                 self._consec_serial_errors = 0
             except Exception as e:
+                if self._is_expected_port_close_read_error(e, self._stop):
+                    break
                 self._consec_serial_errors += 1
                 recoverable = isinstance(e, OSError) or (
                     serial is not None and isinstance(e, serial.SerialException)
@@ -859,6 +895,26 @@ def append_csv(path: str, row: Dict[str, Any]) -> None:
         w.writerow(row)
 
 
+def send_pump_command(
+    ard: Optional["SerialManager"],
+    cmd: str,
+    *,
+    mock_pumps: bool,
+    expect_ack: bool = True,
+) -> str:
+    """
+    Send a line to the pump Arduino, or no-op when ``mock_pumps`` with no ``ard``.
+
+    Returns the ACK string, ``\"\"``, ``\"TIMEOUT\"``, or ``\"ACK:MOCK\"`` for mock pumps.
+    """
+    if ard is not None:
+        return ard.send_command(cmd, expect_ack=expect_ack)
+    if mock_pumps:
+        logger.info("[mock-pumps] not sent (no serial): %s", cmd.strip())
+        return "ACK:MOCK" if expect_ack else "SKIP_ACK"
+    return ""
+
+
 def warn_if_esp_serial_degraded(
     esp: Optional["SerialManager"],
     already_warned: List[bool],
@@ -894,9 +950,10 @@ def run_session(cfg: Config, model: Any, scaler: Any) -> None:
         mock_feed.start()
     else:
         esp = SerialManager(cfg, "input")
-        ard = SerialManager(cfg, "output")
         esp.start()
-        ard.start()
+        if not cfg.mock_pumps:
+            ard = SerialManager(cfg, "output")
+            ard.start()
 
     state = SessionState.IDLE
     current_scent = ""
@@ -975,12 +1032,10 @@ def run_session(cfg: Config, model: Any, scaler: Any) -> None:
             current_scent = name
             pump_num = idx + 1
             cmd = f"PUMP:{pump_num}"
-            ack = ""
-            if ard:
-                ack = ard.send_command(cmd)
+            ack = send_pump_command(ard, cmd, mock_pumps=cfg.mock_pumps)
             logger.info("Pump command %s → %s", cmd, ack)
             append_csv(cfg.csv_log_path, {"time": datetime.now().isoformat(), "pump_cmd": cmd, "ack": ack})
-            if ard and (not ack or ack == "TIMEOUT"):
+            if ard is not None and (not ack or ack == "TIMEOUT"):
                 console.print(
                     Panel(
                         "[bold red]Pump command did not acknowledge[/bold red] (no reply or TIMEOUT).\n"
@@ -1000,7 +1055,7 @@ def run_session(cfg: Config, model: Any, scaler: Any) -> None:
                         "ack": ack,
                     },
                 )
-                ard.send_command("PUMP:OFF", expect_ack=False)
+                send_pump_command(ard, "PUMP:OFF", mock_pumps=cfg.mock_pumps, expect_ack=False)
 
             spray_end = time.time() + cfg.spray_duration
             while time.time() < spray_end:
@@ -1018,8 +1073,7 @@ def run_session(cfg: Config, model: Any, scaler: Any) -> None:
                 warn_if_esp_serial_degraded(esp, esp_serial_warned)
                 time.sleep(0.05)
 
-            if ard:
-                ard.send_command("PUMP:OFF")
+            send_pump_command(ard, "PUMP:OFF", mock_pumps=cfg.mock_pumps, expect_ack=False)
 
             state = SessionState.OBSERVING
             if not cfg.no_dashboard:
@@ -1031,28 +1085,30 @@ def run_session(cfg: Config, model: Any, scaler: Any) -> None:
                     )
                 )
             obs_end = time.time() + cfg.observe_duration
-            note_preds: List[str] = []
+            note_pred_trace: List[Tuple[float, str]] = []
             while time.time() < obs_end:
                 if cfg.mock_mode and mock_feed:
                     r = mock_feed.next_reading()
                     ingest_reading(r)
-                    note_preds.append(live_prediction)
+                    note_pred_trace.append((time.time(), live_prediction))
                 elif esp:
                     try:
                         r = esp.queue.get(timeout=0.2)
                         ingest_reading(r)
-                        note_preds.append(live_prediction)
+                        note_pred_trace.append((time.time(), live_prediction))
                     except queue.Empty:
                         lr = esp.get_latest()
                         if lr is not None:
                             sig = (lr.timestamp, lr.gsr, lr.hr, lr.hrv)
                             if last_ingested_sig != sig:
                                 ingest_reading(lr)
-                                note_preds.append(live_prediction)
+                                note_pred_trace.append((time.time(), live_prediction))
                 warn_if_esp_serial_degraded(esp, esp_serial_warned)
                 time.sleep(0.05)
 
-            ml_match = 1.0 if any(p == "FOCUSED" for p in note_preds[-20:]) else 0.0
+            vote_cutoff = time.time() - cfg.ml_focus_vote_window_sec
+            recent_preds = [p for ts, p in note_pred_trace if ts >= vote_cutoff]
+            ml_match = 1.0 if any(p == "FOCUSED" for p in recent_preds) else 0.0
 
             state = SessionState.ASKING_USER
             q = (
@@ -1071,7 +1127,7 @@ def run_session(cfg: Config, model: Any, scaler: Any) -> None:
                 "user_sentiment": sent,
                 "final_score": final_score,
                 "reply": reply,
-                "ml_pred_sample": note_preds[-1] if note_preds else live_prediction,
+                "ml_pred_sample": note_pred_trace[-1][1] if note_pred_trace else live_prediction,
             })
             append_csv(cfg.csv_log_path, {
                 "time": datetime.now().isoformat(),
@@ -1101,8 +1157,7 @@ def run_session(cfg: Config, model: Any, scaler: Any) -> None:
         append_csv(cfg.csv_log_path, {"time": datetime.now().isoformat(), "summary": summary})
         state = SessionState.COMPLETE
     finally:
-        if ard:
-            ard.send_command("PUMP:OFF", expect_ack=False)
+        send_pump_command(ard, "PUMP:OFF", mock_pumps=cfg.mock_pumps, expect_ack=False)
         if esp:
             esp.close()
         if ard:
@@ -1112,16 +1167,37 @@ def run_session(cfg: Config, model: Any, scaler: Any) -> None:
 
 
 class MockSensorFeed:
-    """Generate synthetic GSR/HR/HRV for end-to-end tests without hardware."""
+    """
+    Generate **demonstration-grade** synthetic biosignals for tests without hardware.
+
+    Not medically validated. Design goals: (1) resting-adult-ish ranges, (2) **HR and
+    HRV coupled** via a synthetic RR-interval process (HRV ≈ RMS of successive RR
+    differences, aligned with hub semantics), (3) GSR with slow tonic drift plus rare
+    phasic bumps (EDA-like), not independent random walks.
+
+    Set ``SCENTSATION_MOCK_SEED`` to an integer for reproducible streams in demos/CI.
+    """
+
+    _DT_SEC = 0.25  # matches ~4 Hz cadence when ``next_reading`` is polled similarly
 
     def __init__(self) -> None:
-        """Initialise internal random-walk state."""
+        """Initialise coupled RR, GSR, and optional RNG seed."""
+        seed_s = os.getenv("SCENTSATION_MOCK_SEED", "").strip()
+        self._rng = random.Random(int(seed_s) if seed_s.isdigit() else None)
         self._t = 0.0
-        self._gsr = 3.0
-        self._hr = 72.0
-        self._hrv = 40.0
         self._stop = threading.Event()
         self._thr: Optional[threading.Thread] = None
+
+        # RR intervals (ms): AR(1) around ~72 bpm; drives both HR and HRV display.
+        self._rr_ms = 830.0
+        self._hr_smooth = 60000.0 / self._rr_ms
+        self._rr_hist: Deque[float] = deque(maxlen=24)
+        for _ in range(12):
+            self._rr_hist.append(self._rr_ms)
+
+        # GSR (µS): tonic baseline + exponentially decaying phasic component.
+        self._gsr_tonic = 4.2
+        self._gsr_phasic = 0.0
 
     def start(self) -> None:
         """No-op thread for API symmetry (generation is synchronous here)."""
@@ -1131,34 +1207,84 @@ class MockSensorFeed:
         """Stop background activity (unused)."""
         self._stop.set()
 
+    def _next_rr_ms(self) -> float:
+        """Short-term HRV: correlated RR jitter (resting adult-ish)."""
+        # AR(1) around 830 ms (~72 bpm), clamped to ~43–108 bpm equivalent.
+        n = self._rng.gauss(0.0, 14.0)
+        rr = 0.94 * self._rr_ms + 0.06 * 830.0 + n
+        return max(560.0, min(1400.0, rr))
+
+    def _hrv_from_rr_ring(self) -> float:
+        """RMS of successive RR diffs (ms), same construction family as firmware/hub."""
+        r = list(self._rr_hist)
+        if len(r) < 3:
+            return 32.0
+        diffs = [r[i + 1] - r[i] for i in range(len(r) - 1)]
+        m = sum(d * d for d in diffs) / len(diffs)
+        return float(math.sqrt(max(0.0, m)))
+
     def next_reading(self) -> SensorReading:
         """Produce the next synthetic sensor row (~4 Hz if called at that rate)."""
-        self._t += 0.25
-        self._gsr += 0.15 * math.sin(self._t * 0.7) + random.uniform(-0.05, 0.05)
-        self._gsr = max(0.5, min(20.0, self._gsr))
-        self._hr += random.uniform(-0.8, 0.8)
-        self._hr += (72.0 - self._hr) * 0.03
-        self._hr = max(50.0, min(110.0, self._hr))
-        self._hrv = 35.0 + 10.0 * math.sin(self._t * 0.2) + random.uniform(-2, 2)
-        self._hrv = max(5.0, min(90.0, self._hrv))
-        return SensorReading(gsr=self._gsr, hr=self._hr, hrv=self._hrv)
+        self._t += self._DT_SEC
+
+        self._rr_ms = self._next_rr_ms()
+        self._rr_hist.append(self._rr_ms)
+        hr_inst = 60000.0 / self._rr_ms
+        self._hr_smooth = 0.82 * self._hr_smooth + 0.18 * hr_inst
+        self._hr_smooth = max(52.0, min(102.0, self._hr_smooth))
+
+        hrv_disp = self._hrv_from_rr_ring()
+        hrv_disp = max(8.0, min(72.0, hrv_disp))
+
+        # Tonic: slow drift + very small breath-like component; phasic: rare spikes.
+        self._gsr_tonic += (
+            0.04 * math.sin(self._t * 0.35)
+            + 0.02 * math.sin(self._t * 0.08)
+            + self._rng.gauss(0.0, 0.04)
+        )
+        self._gsr_tonic = max(1.8, min(11.0, self._gsr_tonic))
+        self._gsr_phasic *= 0.88
+        if self._rng.random() < 0.025:
+            self._gsr_phasic += self._rng.uniform(0.15, 0.95)
+        gsr = self._gsr_tonic + self._gsr_phasic + self._rng.gauss(0.0, 0.06)
+        gsr = max(0.6, min(22.0, gsr))
+
+        return SensorReading(gsr=gsr, hr=self._hr_smooth, hrv=hrv_disp)
 
 
 # === MOCK MODE FOR TESTING WITHOUT HARDWARE ===
 # When ``--mock-mode`` is set, no serial ports are opened; :class:`MockSensorFeed`
-# feeds synthetic data. Combine with ``ensure_stub_model`` so inference runs
-# before you train a deployment model in ``scentsation_ml``.
+# feeds plausible demo-grade biosignals (coupled HR/HRV + EDA-like GSR). Combine
+# with ``ensure_stub_model`` so inference runs before you train a deployment model.
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """Parse CLI arguments for the hub."""
     p = argparse.ArgumentParser(description="Scentsation central hub")
-    p.add_argument("--esp32-port", default=os.environ.get("ESP32_PORT", "/dev/ttyUSB0"))
+    p.add_argument(
+        "--esp32-port",
+        "--sensor-port",
+        default=os.environ.get("ESP32_PORT", "/dev/ttyUSB0"),
+        dest="esp32_port",
+        help="USB serial where the device prints GSR:,HR:,HRV: lines (Arduino Uno is OK). Env: ESP32_PORT.",
+    )
     p.add_argument("--arduino-port", default=os.environ.get("ARDUINO_PORT", "/dev/ttyUSB1"))
     p.add_argument("--model-path", default="models/classifier.joblib")
     p.add_argument("--duration-calibration", type=int, default=30)
     p.add_argument("--duration-spray", type=int, default=5)
     p.add_argument("--duration-observe", type=int, default=10)
+    p.add_argument(
+        "--buffer-window-sec",
+        type=float,
+        default=10.0,
+        help="Rolling sensor buffer length for compute_features (raise if predictions flicker).",
+    )
+    p.add_argument(
+        "--ml-focus-vote-window-sec",
+        type=float,
+        default=8.0,
+        help="Wall-clock seconds of observe-phase predictions used for FOCUSED blend gate (ml_match).",
+    )
     p.add_argument(
         "--scent-notes",
         default="Peppermint,Lemon,Rosemary,Ginger",
@@ -1166,6 +1292,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     p.add_argument("--no-llm", action="store_true", help="Skip Zhipu API calls")
     p.add_argument("--mock-mode", action="store_true", help="Synthetic sensors, no USB serial")
+    p.add_argument(
+        "--mock-pumps",
+        action="store_true",
+        help=(
+            "Open only the sensor serial port; do not connect a pump Arduino. "
+            "Pump commands are logged only (use with real GSR:,HR:,HRV: stream on --esp32-port)."
+        ),
+    )
     p.add_argument("--no-dashboard", action="store_true", help="Disable Rich live refresh snippets")
     p.add_argument(
         "--allow-bare-model",
@@ -1224,6 +1358,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     if os.getenv("SCENTSATION_REQUIRE_HUB_FEATURE_JSON", "").strip() == "1":
         HUB_FEATURE_NAMES = load_hub_feature_names_tuple()
 
+    mock_pumps = bool(args.mock_pumps) and not bool(args.mock_mode)
+    if bool(args.mock_pumps) and bool(args.mock_mode):
+        logger.info("--mock-mode set; ignoring --mock-pumps")
+
     cfg = Config(
         esp32_port=args.esp32_port,
         arduino_port=args.arduino_port,
@@ -1231,9 +1369,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         calibration_duration=args.duration_calibration,
         spray_duration=args.duration_spray,
         observe_duration=args.duration_observe,
+        buffer_window_sec=args.buffer_window_sec,
+        ml_focus_vote_window_sec=args.ml_focus_vote_window_sec,
         scent_notes=[s.strip() for s in args.scent_notes.split(",") if s.strip()],
         use_llm=not args.no_llm,
         mock_mode=args.mock_mode,
+        mock_pumps=mock_pumps,
         no_dashboard=args.no_dashboard,
         zhipu_api_key=os.getenv("ZHIPU_API_KEY", ""),
     )
